@@ -1,0 +1,15 @@
+name: pylis-env
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.8
+  - numpy
+  - xarray
+  - netcdf4
+  - pandas
+  - scipy
+  - tqdm
+  - statsmodels
+  - matplotlib
+  - seaborn
+  - cartopy
