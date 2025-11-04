@@ -375,7 +375,8 @@ class LISReader:
 
         # --- Process files ---
         results = self._process_files(files, worker, desc="Reading increment files")
-
+        results.sort(key=lambda x: self._extract_datetime_from_filename(x[0], pattern_str))
+        times = [self._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
         # --- Allocate cube ---
         data_cube = np.full((len(files), n_layers, n_lat, n_lon), np.nan)
 
@@ -441,7 +442,8 @@ class LISReader:
 
         # --- Process files ---
         results = self._process_files(files, worker, desc="Reading spread files")
-
+        results.sort(key=lambda x: self._extract_datetime_from_filename(x[0], pattern_str))
+        times = [self._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
         # --- Allocate cube ---
         data_cube = np.full((len(files), n_layers, n_lat, n_lon), np.nan)
 
@@ -512,6 +514,12 @@ class LISReader:
 
         # --- Process files in parallel/serial using the existing helper ---
         results = self._process_files(files, worker, desc="Reading LIS history files")
+
+        # Sort results by datetime
+        results.sort(key=lambda x: self._extract_datetime_from_filename(x[0], pattern_str))
+        times = [self._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
+
+        print("Sorted results based on extracted datetime from filenames.")
 
         # --- Read first file to infer dimensions ---
         sample_data = results[0][1]  # results: list of (filename, data_array)
@@ -646,6 +654,8 @@ class LISReader:
 
         # Process files in parallel or serial using the common helper
         results = self._process_files(files, worker, desc="Reading observation files")
+        results.sort(key=lambda x: self._extract_datetime_from_filename(x[0], pattern_str))
+        print("Sorted results based on extracted datetime from filenames.")
 
         # Extract dates and arrays
         obs_dates = []
