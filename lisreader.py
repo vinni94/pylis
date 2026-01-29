@@ -92,6 +92,29 @@ class LISReader:
         return None
 
     @staticmethod
+    def _read_nc_spread(file_path, varname, layers, a="01"):
+        """
+        Read LIS EnKF spread / incr / innov files where layers are stored
+        as separate variables.
+        Returns array with shape (layer, y, x)
+        """
+        try:
+            with Dataset(file_path, "r") as f:
+                arrs = []
+                for l in layers:
+                    vname = f"{varname} Layer {l}_{a}"
+                    if vname not in f.variables:
+                        raise KeyError(f"{vname} not found in {file_path}")
+                    arrs.append(f.variables[vname][:].data)
+
+                data = np.stack(arrs, axis=0)
+                return data
+
+        except Exception as e:
+            print(f"Failed to read {file_path}: {e}")
+            return None
+
+    @staticmethod
     def _read_single_obs_file(file_path, n_lat, n_lon, rescaled=False, a="01", d="01"):
         """
         Read a single binary observation file using regex to filter correct 'a' and 'd'.
@@ -428,8 +451,9 @@ class LISReader:
         n_layers = 1 if layers is None else len(layers)
 
         # --- Construct file pattern ---
-        pattern_str = rf"LIS_DA_EnKF_.*{h:02d}00_spread\.a{a}\.d{d}\.nc$"
+        pattern_str = rf"LIS_DA_EnKF_(\d{{12}})_spread\.a{a}\.d{d}\.nc"
         files = self._get_files(pattern_str, subfolder=subfolder)
+        
         if len(files) == 0:
             raise FileNotFoundError("No spread files found.")
 
@@ -438,7 +462,7 @@ class LISReader:
         times = [self._extract_datetime_from_filename(f, pattern_str) for f in files]
 
         # --- Worker function ---
-        worker = partial(self._read_nc_variable, varname=varname, layers=layers, a=a)
+        worker = partial(self._read_nc_spread, varname="ensspread_Soil Moisture", layers=layers, a=a)
 
         # --- Process files ---
         results = self._process_files(files, worker, desc="Reading spread files")
