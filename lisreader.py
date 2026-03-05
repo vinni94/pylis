@@ -92,22 +92,64 @@ class LISReader:
         return None
 
     @staticmethod
-    def _read_nc_spread(file_path, varname, layers, a="01"):
+    def _get_spread_varname(file_path, varname_prefix, a="01"):
         """
-        Read LIS EnKF spread / incr / innov files where layers are stored
-        as separate variables.
-        Returns array with shape (layer, y, x)
+        Dynamically detect the actual variable name in the spread file.
+        Searches for variables matching 'ensspread_<varname_prefix>*_{a}'.
+        Returns (varname_found, is_layered) tuple.
         """
         try:
             with Dataset(file_path, "r") as f:
-                arrs = []
-                for l in layers:
-                    vname = f"{varname} Layer {l}_{a}"
+                for var in f.variables.keys():
+                    # Look for ensspread_* variables matching the instance
+                    if var.startswith("ensspread_") and var.endswith(f"_{a}"):
+                        # Check if varname_prefix is in this variable name
+                        if varname_prefix in var:
+                            # Check if it's a layered variable (contains "Layer")
+                            is_layered = "Layer" in var
+                            # Extract the base variable name (without Layer X and _a suffix)
+                            if is_layered:
+                                base_var = var.replace(f"_{a}", "").rsplit(" Layer ", 1)[0]
+                            else:
+                                base_var = var.replace(f"_{a}", "")
+                            return base_var, is_layered
+        except Exception as e:
+            print(f"Error detecting variable in {file_path}: {e}")
+        return None, False
+
+    @staticmethod
+    def _read_nc_spread(file_path, varname, layers, a="01"):
+        """
+        Read LIS EnKF spread / incr / innov files.
+        Handles both layered variables (Soil Moisture) and single variables (LAI, etc.).
+        Returns array with shape (layer, y, x) for layered, or (1, y, x) for non-layered.
+        """
+        try:
+            with Dataset(file_path, "r") as f:
+                # Check if this is a layered variable (contains "Layer" in variable names)
+                is_layered = False
+                if layers is not None and len(layers) > 0:
+                    test_vname = f"{varname} Layer {layers[0]}_{a}"
+                    is_layered = test_vname in f.variables
+                
+                if is_layered and layers is not None:
+                    # Read layered variables (Soil Moisture, etc.)
+                    arrs = []
+                    for l in layers:
+                        vname = f"{varname} Layer {l}_{a}"
+                        if vname not in f.variables:
+                            raise KeyError(f"{vname} not found in {file_path}")
+                        arrs.append(f.variables[vname][:].data)
+                    data = np.stack(arrs, axis=0)
+                else:
+                    # Read non-layered variable (LAI, etc.)
+                    vname = f"{varname}_{a}"
                     if vname not in f.variables:
                         raise KeyError(f"{vname} not found in {file_path}")
-                    arrs.append(f.variables[vname][:].data)
-
-                data = np.stack(arrs, axis=0)
+                    # Add a dummy layer dimension for consistency
+                    data = f.variables[vname][:].data
+                    data = np.expand_dims(data, axis=0)
+                
                 return data
 
         except Exception as e:
@@ -441,6 +483,9 @@ class LISReader:
                     a="01", d="01", h=0, freq="1D", start=None, end=None):
         """
         Read LIS ensemble spread files and return an xarray.DataArray.
+        Automatically detects variable naming and whether to read layers.
+        - For variables containing 'Soil Moisture', reads the specified layers
+        - For other variables (LAI, etc.), reads the single variable without layers
         """
         # --- Get LIS input lat/lon from reference file ---
         with Dataset(self.lis_input_file, "r") as f:
@@ -448,7 +493,6 @@ class LISReader:
             lons = f.variables["lon"][:].data
 
         n_lat, n_lon = lats.shape
-        n_layers = 1 if layers is None else len(layers)
 
         # --- Construct file pattern ---
         pattern_str = rf"LIS_DA_EnKF_(\d{{12}})_spread\.a{a}\.d{d}\.nc"
@@ -459,38 +503,65 @@ class LISReader:
 
         # --- Sort files by datetime ---
         files.sort(key=lambda f: self._extract_datetime_from_filename(f, pattern_str))
-        times = [self._extract_datetime_from_filename(f, pattern_str) for f in files]
+
+        # --- Detect variable name and whether it has layers from first file ---
+        actual_varname, is_layered = self._get_spread_varname(files[0], varname.replace("ensspread_", ""), a=a)
+        
+        if actual_varname is None:
+            raise ValueError(f"Could not find variable matching '{varname}' in {files[0]}")
+        
+        print(f"Detected variable: {actual_varname}, Layered: {is_layered}")
+        
+        # Determine number of layers and which layers to use
+        if is_layered and layers is not None and len(layers) > 0:
+            n_layers = len(layers)
+            layers_to_read = layers
+        elif is_layered:
+            # Default to reading what's available
+            n_layers = 1
+            layers_to_read = [1]
+        else:
+            # Non-layered variable
+            n_layers = 1
+            layers_to_read = None
 
         # --- Worker function ---
-        worker = partial(self._read_nc_spread, varname="ensspread_Soil Moisture", layers=layers, a=a)
+        worker = partial(self._read_nc_spread, varname=actual_varname, layers=layers_to_read, a=a)
 
         # --- Process files ---
         results = self._process_files(files, worker, desc="Reading spread files")
         results.sort(key=lambda x: self._extract_datetime_from_filename(x[0], pattern_str))
         times = [self._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
+        
         # --- Allocate cube ---
         data_cube = np.full((len(files), n_layers, n_lat, n_lon), np.nan)
 
         for i, (_, arr) in enumerate(results):
-            arr = np.array(arr, dtype=float)
-            arr[arr == -9999] = np.nan
-            data_cube[i] = arr
+            if arr is not None:
+                arr = np.array(arr, dtype=float)
+                arr[arr == -9999] = np.nan
+                data_cube[i] = arr
 
         # --- Build xarray ---
+        if is_layered and layers_to_read is not None:
+            layer_coords = layers_to_read
+        else:
+            layer_coords = [1]
+        
         da = xr.DataArray(
             data=data_cube,
             dims=["time", "layer", "x", "y"],
             coords=dict(
                 lon=(["x","y"], lons),
                 lat=(["x","y"], lats),
-                layer=[1] if layers is None else layers,
+                layer=layer_coords,
                 time=times,
             ),
-            attrs=dict(description="LIS model spread", variable=varname),
+            attrs=dict(description="LIS model spread", variable=varname, is_layered=is_layered),
         )
 
-        if layers is None:
-            da = da.sel(layer=1)
+        if n_layers == 1 and len(layer_coords) == 1:
+            da = da.sel(layer=layer_coords[0])
 
         # --- Resample if requested ---
         if freq:
