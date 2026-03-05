@@ -97,6 +97,7 @@ class LISReader:
         Dynamically detect the actual variable name in the spread file.
         Searches for variables matching 'ensspread_<varname_prefix>*_{a}'.
         Returns (varname_found, is_layered) tuple.
+        varname_found is returned WITHOUT the 'ensspread_' prefix.
         """
         try:
             with Dataset(file_path, "r") as f:
@@ -107,11 +108,12 @@ class LISReader:
                         if varname_prefix in var:
                             # Check if it's a layered variable (contains "Layer")
                             is_layered = "Layer" in var
-                            # Extract the base variable name (without Layer X and _a suffix)
+                            # Extract the base variable name (without ensspread_ prefix and without Layer X and _a suffix)
+                            var_no_prefix = var.replace("ensspread_", "")
                             if is_layered:
-                                base_var = var.replace(f"_{a}", "").rsplit(" Layer ", 1)[0]
+                                base_var = var_no_prefix.replace(f"_{a}", "").rsplit(" Layer ", 1)[0]
                             else:
-                                base_var = var.replace(f"_{a}", "")
+                                base_var = var_no_prefix.replace(f"_{a}", "")
                             return base_var, is_layered
         except Exception as e:
             print(f"Error detecting variable in {file_path}: {e}")
@@ -122,6 +124,7 @@ class LISReader:
         """
         Read LIS EnKF spread / incr / innov files.
         Handles both layered variables (Soil Moisture) and single variables (LAI, etc.).
+        varname should be passed WITHOUT the 'ensspread_' prefix (e.g., "Soil Moisture" or "LAI").
         Returns array with shape (layer, y, x) for layered, or (1, y, x) for non-layered.
         """
         try:
@@ -129,21 +132,21 @@ class LISReader:
                 # Check if this is a layered variable (contains "Layer" in variable names)
                 is_layered = False
                 if layers is not None and len(layers) > 0:
-                    test_vname = f"{varname} Layer {layers[0]}_{a}"
+                    test_vname = f"ensspread_{varname} Layer {layers[0]}_{a}"
                     is_layered = test_vname in f.variables
                 
                 if is_layered and layers is not None:
                     # Read layered variables (Soil Moisture, etc.)
                     arrs = []
                     for l in layers:
-                        vname = f"{varname} Layer {l}_{a}"
+                        vname = f"ensspread_{varname} Layer {l}_{a}"
                         if vname not in f.variables:
                             raise KeyError(f"{vname} not found in {file_path}")
                         arrs.append(f.variables[vname][:].data)
                     data = np.stack(arrs, axis=0)
                 else:
                     # Read non-layered variable (LAI, etc.)
-                    vname = f"{varname}_{a}"
+                    vname = f"ensspread_{varname}_{a}"
                     if vname not in f.variables:
                         raise KeyError(f"{vname} not found in {file_path}")
                     # Add a dummy layer dimension for consistency
@@ -505,7 +508,7 @@ class LISReader:
         files.sort(key=lambda f: self._extract_datetime_from_filename(f, pattern_str))
 
         # --- Detect variable name and whether it has layers from first file ---
-        actual_varname, is_layered = self._get_spread_varname(files[0], varname.replace("ensspread_", ""), a=a)
+        actual_varname, is_layered = self._get_spread_varname(files[0], varname, a=a)
         
         if actual_varname is None:
             raise ValueError(f"Could not find variable matching '{varname}' in {files[0]}")
