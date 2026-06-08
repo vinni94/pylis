@@ -118,7 +118,7 @@ class LISReader:
         except Exception as e:
             print(f"Error detecting variable in {file_path}: {e}")
         return None, False
-        
+
     @staticmethod
     def _read_nc_incr(file_path, varname, layers, a="01"):
         """
@@ -457,6 +457,7 @@ class LISReader:
         Read LIS EnKF increment files and return an xarray.DataArray.
         Variable naming: anlys_incr_<varname> Layer {l}_{a}  (layered)
                     or anlys_incr_<varname>_{a}             (non-layered)
+        Auto-detects whether the variable is layered from the first file found.
         """
         pattern_str = rf"LIS_DA_EnKF_(\d{{12}})_incr\.a{a}\.d{d}\.nc"
         files = self._get_files(pattern_str, subfolder=subfolder)
@@ -464,12 +465,25 @@ class LISReader:
         if len(files) == 0:
             raise FileNotFoundError("No increment files found.")
 
-        worker = partial(LISReader._read_nc_incr, varname=varname, layers=layers, a=a)
+        # --- Auto-detect layering from the first file ---
+        with Dataset(files[0], "r") as f:
+            test_vname = f"anlys_incr_{varname} Layer {layers[0]}_{a}"
+            is_layered = test_vname in f.variables
+
+        if is_layered:
+            layers_to_use = layers
+            n_layers = len(layers)
+        else:
+            layers_to_use = None  # signal to _read_nc_incr to skip layer loop
+            n_layers = 1
+
+        print(f"Variable '{varname}' (a={a}): layered={is_layered}, n_layers={n_layers}")
+
+        worker = partial(LISReader._read_nc_incr, varname=varname, layers=layers_to_use, a=a)
         results = self._process_files(files, worker, desc="Reading increment files")
         results.sort(key=lambda x: LISReader._extract_datetime_from_filename(x[0], pattern_str))
 
         times = [LISReader._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
-        n_layers = len(layers) if layers else 1
         n_time = len(results)
 
         data_cube = np.full((n_time, n_layers, self.n_lat, self.n_lon), np.nan)
@@ -485,15 +499,16 @@ class LISReader:
             coords=dict(
                 lon=(["x", "y"], self.lons),
                 lat=(["x", "y"], self.lats),
-                layer=layers if layers else [1],
+                layer=layers_to_use if is_layered else [1],
                 time=times,
             ),
-            attrs=dict(description="LIS analysis increments", variable=varname),
+            attrs=dict(description="LIS analysis increments", variable=varname,
+                    is_layered=is_layered),
         )
 
-        # Drop layer dim if only one layer (non-layered variable)
-        if n_layers == 1 and (layers is None or len(layers) == 1):
-            da = da.sel(layer=da.layer[0])
+        # Squeeze out dummy layer dim for non-layered variables
+        if not is_layered:
+            da = da.sel(layer=1)
 
         if freq:
             da = da.sortby("time").resample(time=freq).mean()
