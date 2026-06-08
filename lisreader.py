@@ -118,6 +118,43 @@ class LISReader:
         except Exception as e:
             print(f"Error detecting variable in {file_path}: {e}")
         return None, False
+        
+    @staticmethod
+    def _read_nc_incr(file_path, varname, layers, a="01"):
+        """
+        Read LIS EnKF increment files.
+        Handles layered variables: anlys_incr_<varname> Layer {l}_{a}
+        and non-layered: anlys_incr_<varname>_{a}
+        Returns array with shape (n_layers, y, x).
+        """
+        try:
+            with Dataset(file_path, "r") as f:
+                # Check if layered
+                if layers is not None:
+                    test_vname = f"anlys_incr_{varname} Layer {layers[0]}_{a}"
+                    is_layered = test_vname in f.variables
+                else:
+                    is_layered = False
+
+                if is_layered:
+                    arrs = []
+                    for l in layers:
+                        vname = f"anlys_incr_{varname} Layer {l}_{a}"
+                        if vname not in f.variables:
+                            raise KeyError(f"{vname} not found in {file_path}")
+                        arrs.append(f.variables[vname][:].data)
+                    data = np.stack(arrs, axis=0)  # (n_layers, y, x)
+                else:
+                    vname = f"anlys_incr_{varname}_{a}"
+                    if vname not in f.variables:
+                        raise KeyError(f"{vname} not found in {file_path}")
+                    data = f.variables[vname][:].data
+                    data = np.expand_dims(data, axis=0)  # (1, y, x)
+
+            return data
+        except Exception as e:
+            print(f"Failed to read {file_path}: {e}")
+            return None
 
     @staticmethod
     def _read_nc_spread(file_path, varname, layers, a="01"):
@@ -414,74 +451,55 @@ class LISReader:
             dc = dc.sortby("time").resample(time=freq).mean()
         return dc
     
-    def incr_cube(self, subfolder="EnKF", varname="Soil Moisture", layers=[1,2,3,4],
-              a="01", d="01", freq=None, start=None, end=None):
+    def read_incr_cube(self, subfolder="EnKF", varname="Soil Moisture",
+                   layers=[1, 2, 3, 4], a="01", d="01", freq=None):
         """
-        Read LIS increment files and return an xarray.DataArray.
+        Read LIS EnKF increment files and return an xarray.DataArray.
+        Variable naming: anlys_incr_<varname> Layer {l}_{a}  (layered)
+                    or anlys_incr_<varname>_{a}             (non-layered)
         """
-        # --- Get LIS input lat/lon from reference file ---
-        with Dataset(self.lis_input_file, "r") as f:
-            lats = f.variables["lat"][:].data
-            lons = f.variables["lon"][:].data
-        
-        n_lat, n_lon = lats.shape
-        n_layers = 1 if layers is None else len(layers)
-
-        # --- Construct file pattern ---
         pattern_str = rf"LIS_DA_EnKF_(\d{{12}})_incr\.a{a}\.d{d}\.nc"
-
         files = self._get_files(pattern_str, subfolder=subfolder)
+
         if len(files) == 0:
             raise FileNotFoundError("No increment files found.")
 
-        # --- Sort files by datetime ---
-        files.sort(key=lambda f: self._extract_datetime_from_filename(f, pattern_str))
-        times = [self._extract_datetime_from_filename(f, pattern_str) for f in files]
-
-        # --- Worker function ---
-        worker = partial(self._read_nc_variable, varname=varname, layers=layers)
-
-        # --- Process files ---
+        worker = partial(LISReader._read_nc_incr, varname=varname, layers=layers, a=a)
         results = self._process_files(files, worker, desc="Reading increment files")
-        results.sort(key=lambda x: self._extract_datetime_from_filename(x[0], pattern_str))
-        times = [self._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
-        # --- Allocate cube ---
-        data_cube = np.full((len(files), n_layers, n_lat, n_lon), np.nan)
+        results.sort(key=lambda x: LISReader._extract_datetime_from_filename(x[0], pattern_str))
 
+        times = [LISReader._extract_datetime_from_filename(f, pattern_str) for f, _ in results]
+        n_layers = len(layers) if layers else 1
+        n_time = len(results)
+
+        data_cube = np.full((n_time, n_layers, self.n_lat, self.n_lon), np.nan)
         for i, (_, arr) in enumerate(results):
-            arr = np.array(arr, dtype=float)
-            arr[arr == -9999] = np.nan
-            arr[arr == 0] = np.nan  # no increment
-            data_cube[i] = arr
+            if arr is not None:
+                arr = np.array(arr, dtype=float)
+                arr[arr == -9999] = np.nan
+                data_cube[i] = arr
 
-        # --- Build xarray ---
         da = xr.DataArray(
             data=data_cube,
             dims=["time", "layer", "x", "y"],
             coords=dict(
-                lon=(["x","y"], lons),
-                lat=(["x","y"], lats),
-                layer=[1] if layers is None else layers,
+                lon=(["x", "y"], self.lons),
+                lat=(["x", "y"], self.lats),
+                layer=layers if layers else [1],
                 time=times,
             ),
-            attrs=dict(description="LIS increments"),
+            attrs=dict(description="LIS analysis increments", variable=varname),
         )
 
-        if layers is None:
-            da = da.sel(layer=1)
+        # Drop layer dim if only one layer (non-layered variable)
+        if n_layers == 1 and (layers is None or len(layers) == 1):
+            da = da.sel(layer=da.layer[0])
 
-        # --- Resample if requested ---
         if freq:
-            da = da.resample(time=freq).mean()
-
-        # --- Filter by start/end date ---
-        if start is not None and end is not None:
-            start_dt = pd.to_datetime(start, dayfirst=True)
-            end_dt = pd.to_datetime(end, dayfirst=True)
-            da = da.sel(time=slice(start_dt, end_dt))
+            da = da.sortby("time").resample(time=freq).mean()
 
         return da
-
+        
     def spread_cube(self, subfolder="EnKF", varname="Soil Moisture", layers=[1,2,3,4],
                     a="01", d="01", h=0, freq="1D", start=None, end=None):
         """
